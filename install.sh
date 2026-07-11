@@ -5,6 +5,11 @@
 # Usage:
 #   bash install.sh            # VirtualBox mode
 #   bash install.sh --vmware   # VMware mode
+#
+# Under WSL2, the hypervisor and Vagrant must run on Windows itself (nesting a
+# hypervisor inside a VM is unreliable when Hyper-V is active). This script
+# detects WSL2 and checks/wires up the Windows-side install instead of trying
+# to apt-get a hypervisor into WSL — same pattern GOAD's WSL provider uses.
 
 set -e
 
@@ -22,8 +27,14 @@ ok()   { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[-]${NC} $1"; exit 1; }
 
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
+}
+
 detect_os() {
-    if [[ "$OSTYPE" == "darwin"* ]]; then
+    if is_wsl; then
+        echo "wsl"
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
         echo "macos"
     elif grep -qi "ubuntu\|debian\|kali" /etc/os-release 2>/dev/null; then
         echo "debian"
@@ -141,6 +152,72 @@ install_vmware_plugin() {
     fi
 }
 
+# ── WSL2 (hypervisor + Vagrant run on Windows, not inside WSL) ──────────────
+
+WIN_VBOXMANAGE="/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+WIN_VMRUN="/mnt/c/Program Files (x86)/VMware/VMware Workstation/vmrun.exe"
+
+check_wsl_drive() {
+    case "$(pwd)" in
+        /mnt/*) ;;
+        *)
+            warn "This repo is on the WSL-only filesystem, not a Windows drive."
+            warn "vagrant.exe needs the project under a Windows-mounted path (e.g. /mnt/c/Users/you/snowcorp-lab)."
+            warn "Clone or move it there before running 'make up' — see README for details."
+            ;;
+    esac
+}
+
+check_windows_vagrant() {
+    if command -v vagrant.exe &>/dev/null; then
+        ok "Vagrant found on Windows ($(vagrant.exe --version))"
+    else
+        warn "Vagrant not found on Windows. Install it on Windows (not inside WSL):"
+        warn "  https://developer.hashicorp.com/vagrant/downloads"
+    fi
+}
+
+check_windows_hypervisor() {
+    if [[ "$VMWARE_MODE" == true ]]; then
+        if [[ -f "$WIN_VMRUN" ]]; then
+            ok "VMware Workstation found on Windows"
+        else
+            warn "VMware Workstation not found on Windows. Install it manually:"
+            warn "  https://www.vmware.com/products/desktop-hypervisor.html"
+        fi
+    else
+        if [[ -f "$WIN_VBOXMANAGE" ]]; then
+            ok "VirtualBox found on Windows"
+        else
+            warn "VirtualBox not found on Windows. Install it manually:"
+            warn "  https://www.virtualbox.org/wiki/Downloads"
+        fi
+    fi
+}
+
+install_vmware_plugin_windows() {
+    if vagrant.exe plugin list 2>/dev/null | grep -q "vagrant-vmware-desktop"; then
+        ok "vagrant-vmware-desktop plugin already installed (Windows)"
+    else
+        warn "Installing vagrant-vmware-desktop plugin on Windows..."
+        vagrant.exe plugin install vagrant-vmware-desktop
+        ok "vagrant-vmware-desktop plugin installed (Windows)"
+    fi
+    warn "The Vagrant VMware Utility must also be installed on Windows:"
+    warn "  https://developer.hashicorp.com/vagrant/install/vmware"
+}
+
+install_wsl() {
+    ok "Detected WSL2 — Vagrant and the hypervisor run on Windows, not inside WSL"
+    check_wsl_drive
+    check_windows_vagrant
+    check_windows_hypervisor
+    install_ansible_debian
+    if [[ "$VMWARE_MODE" == true ]] && command -v vagrant.exe &>/dev/null; then
+        install_vmware_plugin_windows
+    fi
+}
+
 install_debian() {
     ok "Detected Debian/Ubuntu/Kali"
     if [[ "$VMWARE_MODE" == false ]]; then
@@ -187,6 +264,7 @@ echo ""
 OS=$(detect_os)
 
 case $OS in
+    wsl)    install_wsl    ;;
     debian) install_debian ;;
     macos)  install_macos  ;;
     *)      err "Unsupported OS. Install Vagrant, Ansible, and your hypervisor manually." ;;

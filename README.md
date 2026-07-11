@@ -104,7 +104,7 @@ VMware Workstation 17+ / Fusion 13+ can be used instead of VirtualBox — see [V
 
 **Host OS:** Linux (Ubuntu, Debian, Kali) or macOS. Windows requires WSL2 — see [Troubleshooting](#troubleshooting).
 
-> Must run on a **bare-metal machine** or a VM with nested virtualisation explicitly enabled. See [Troubleshooting](#troubleshooting) if you are running inside VMware or VirtualBox.
+> The hypervisor (VirtualBox/VMware) must run on a **bare-metal machine**, or a VM with nested virtualisation explicitly enabled. On Windows, install the hypervisor on Windows itself and drive it from WSL2 rather than nesting — see [Troubleshooting → Running on Windows (WSL2 setup)](#troubleshooting).
 
 ---
 
@@ -314,22 +314,37 @@ vagrant provision ws01
 <details>
 <summary><strong>Running on Windows (WSL2 setup)</strong></summary>
 
-Ansible does not run on Windows natively. Use WSL2:
+Ansible does not run on Windows natively, and nesting a hypervisor inside a VM
+(e.g. enabling "Virtualize Intel VT-x/EPT" on a Kali VM) is unreliable once
+Hyper-V is active — which it is by default if you use WSL2 or the Android
+emulator. So don't nest: install the hypervisor and Vagrant **on Windows
+itself** (one level under Hyper-V, which works fine), and drive them from
+WSL2 for Ansible.
 
-```bash
-# Inside WSL2 (Ubuntu)
-sudo apt-get update && sudo apt-get install -y ansible
-ansible-galaxy collection install ansible.windows microsoft.ad community.windows
+1. Install VirtualBox (or VMware Workstation) **on Windows**, not inside WSL2.
+2. Install Vagrant **on Windows**: https://developer.hashicorp.com/vagrant/downloads
+3. Clone this repo onto a **Windows-mounted drive**, not the WSL-only filesystem:
+   ```bash
+   cd /mnt/c/Users/YourName/
+   git clone https://github.com/garvitv14/snowcorp-lab
+   cd snowcorp-lab
+   ```
+4. Run the installer and lab from inside WSL2:
+   ```bash
+   make install          # or: make install-vmware
+   make check            # or: make check-vmware
+   make up                # or: make up-vmware
+   ```
 
-# Let WSL2 Vagrant talk to Windows VirtualBox
-export VAGRANT_WSL_ENABLE_WINDOWS_ACCESS="1"
-export PATH="$PATH:/mnt/c/Program Files/Oracle/VirtualBox"
+`install.sh` and the `Makefile` auto-detect WSL2: they install Ansible inside
+WSL2, check for VirtualBox/VMware/Vagrant on the Windows side under `/mnt/c`,
+and call `vagrant.exe` (via WSL interop) instead of a Linux `vagrant` binary
+— so `make up` behaves the same as on native Linux/macOS. No
+`VAGRANT_WSL_ENABLE_WINDOWS_ACCESS` or manual `PATH` edits needed.
 
-cd /mnt/c/Users/YourName/snowcorp-lab
-make up
-```
-
-VirtualBox and Vagrant must be installed on Windows, not inside WSL2.
+Your Kali attacker VM is unaffected by any of this — it doesn't need nested
+virtualisation either, it just needs a NIC on the lab's internal network (see
+[Connecting Your Attacker Machine](#connecting-your-attacker-machine)).
 
 </details>
 
