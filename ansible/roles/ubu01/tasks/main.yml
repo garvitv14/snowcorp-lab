@@ -1,0 +1,118 @@
+---
+# UBU01 — Ubuntu 22.04 configuration
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - nfs-kernel-server
+      - zip
+      - unzip
+      - openssh-server
+    state: present
+    update_cache: true
+
+- name: Create corpuser
+  ansible.builtin.user:
+    name: corpuser
+    password: "{{ 'Corp@2026!' | password_hash('sha512') }}"
+    shell: /bin/bash
+    create_home: true
+
+- name: Create NFS share directory structure
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /opt/shares
+    - /opt/shares/finance
+    - /opt/shares/hr
+    - /opt/shares/it
+
+- name: Drop db_creds.conf in finance share (credential exposure)
+  ansible.builtin.copy:
+    dest: /opt/shares/finance/db_creds.conf
+    content: |
+      # SnowCorp Finance Database Configuration
+      # DO NOT SHARE — Internal Use Only
+
+      [database]
+      host     = 10.10.10.20
+      port     = 5432
+      name     = finance_db
+
+      [auth]
+      username = corpuser
+      password = Corp@2026!
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Drop dummy finance files (make share look realistic)
+  ansible.builtin.copy:
+    dest: "/opt/shares/finance/{{ item }}"
+    content: "SnowCorp confidential finance data — Q1 2026\n"
+    mode: "0644"
+  loop:
+    - Q1_2026_Report.xlsx.txt
+    - payroll_march_2026.csv.txt
+    - budget_forecast.pdf.txt
+
+- name: Configure NFS exports
+  ansible.builtin.copy:
+    dest: /etc/exports
+    content: |
+      /opt/shares/finance  *(rw,sync,no_subtree_check,no_root_squash)
+      /opt/shares/hr       *(ro,sync,no_subtree_check,root_squash)
+      /opt/shares/it       *(ro,sync,no_subtree_check,root_squash)
+    mode: "0644"
+
+- name: Enable and start NFS server
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - nfs-kernel-server
+    - rpcbind
+
+- name: Re-export NFS shares
+  ansible.builtin.command: exportfs -ra
+  changed_when: true
+
+- name: Configure sudoers for corpuser
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/corpuser
+    content: |
+      corpuser ALL=(ALL) NOPASSWD: /usr/bin/zip
+    validate: /usr/sbin/visudo -cf %s
+    mode: "0440"
+
+- name: Write root flag
+  ansible.builtin.copy:
+    dest: /root/flag.txt
+    content: "FLAG{ubu01_root_owned}\n"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Set corpuser home directory permissions
+  ansible.builtin.file:
+    path: /home/corpuser
+    owner: corpuser
+    group: corpuser
+    mode: "0750"
+
+- name: Allow password authentication in SSH (needed for corpuser login)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PasswordAuthentication"
+    line: "PasswordAuthentication yes"
+    state: present
+
+- name: Restart SSH
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted

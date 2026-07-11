@@ -1,0 +1,60 @@
+---
+# WS02 — corp.local workstation
+
+- name: Set DNS to DC02 for domain join
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+               Sort-Object ifIndex | Select-Object -Last 1
+      Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+        -ServerAddresses 10.10.10.20
+
+- name: Join WS02 to corp.local domain
+  microsoft.ad.membership:
+    dns_domain_name: corp.local
+    domain_admin_user: CORP\Administrator
+    domain_admin_password: "Admin@2026!"
+    state: domain
+    reboot: true
+
+- name: Wait for WS02 to rejoin after domain reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 180
+
+- name: Configure WS02 AD settings
+  ansible.windows.win_powershell:
+    script: |
+      $cred = New-Object System.Management.Automation.PSCredential(
+          "CORP\Administrator",
+          (ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force)
+      )
+      Invoke-Command -ComputerName 10.10.10.20 -Credential $cred -ScriptBlock {
+          Set-ADComputer -Identity "WS02" -TrustedForDelegation $true
+      }
+
+- name: Add svc_deploy as local administrator on WS02
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - CORP\svc_deploy
+    state: present
+
+- name: Disable Windows Defender
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Set-MpPreference -DisableScriptScanning $true
+
+- name: Register Administrator startup task on WS02
+  ansible.windows.win_powershell:
+    script: |
+      $pass = ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force
+      $cred = New-Object System.Management.Automation.PSCredential("CORP\Administrator", $pass)
+      $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                     -Argument '-WindowStyle Hidden -Command "Start-Sleep 10"'
+      $trigger   = New-ScheduledTaskTrigger -AtStartup
+      $principal = New-ScheduledTaskPrincipal -UserId "CORP\Administrator" `
+                     -LogonType Interactive -RunLevel Highest
+      Register-ScheduledTask -TaskName "AdminStartup" -Action $action `
+        -Trigger $trigger -Principal $principal -Force | Out-Null

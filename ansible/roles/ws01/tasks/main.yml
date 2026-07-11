@@ -1,0 +1,68 @@
+---
+# WS01 — Dual-homed Windows 11 workstation
+
+- name: Enable IP forwarding (WS01 bridges lab.local and corp.local networks)
+  ansible.windows.win_powershell:
+    script: |
+      Get-NetAdapter | ForEach-Object {
+          Set-NetIPInterface -InterfaceIndex $_.ifIndex -Forwarding Enabled -ErrorAction SilentlyContinue
+      }
+
+- name: Set DNS to DC01 for domain join
+  ansible.windows.win_powershell:
+    script: |
+      $lab = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+             Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 `
+               -ErrorAction SilentlyContinue).IPAddress -like "192.168.136.*" }
+      Set-DnsClientServerAddress -InterfaceIndex $lab.ifIndex -ServerAddresses 192.168.136.10
+
+- name: Join WS01 to lab.local domain
+  microsoft.ad.membership:
+    dns_domain_name: lab.local
+    domain_admin_user: LAB\Administrator
+    domain_admin_password: "Admin@2026!"
+    state: domain
+    reboot: true
+
+- name: Wait for WS01 to rejoin after domain reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 180
+
+- name: Add john.smith as Local Administrator on WS01
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - LAB\john.smith
+    state: present
+
+- name: Enable WinRM firewall rule
+  community.windows.win_firewall_rule:
+    name: WinRM HTTP
+    localport: 5985
+    action: allow
+    direction: in
+    protocol: tcp
+    state: present
+    enabled: true
+
+- name: Disable Windows Defender real-time protection (lab convenience)
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Set-MpPreference -DisableScriptScanning $true
+      Set-MpPreference -DisableBehaviorMonitoring $true
+
+- name: Create john.smith Documents folder and drop Ligolo agent placeholder
+  ansible.windows.win_file:
+    path: C:\Users\john.smith\Documents
+    state: directory
+
+- name: Register john.smith startup task
+  ansible.windows.win_powershell:
+    script: |
+      $action  = New-ScheduledTaskAction -Execute "cmd.exe" `
+                   -Argument '/c pushd \\192.168.136.30\share 2>nul & popd'
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User "LAB\john.smith"
+      Register-ScheduledTask -TaskName "MapNetDrive" -Action $action `
+        -Trigger $trigger -RunLevel Highest -Force | Out-Null

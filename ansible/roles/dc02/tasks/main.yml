@@ -1,0 +1,48 @@
+---
+# DC02 — corp.local Domain Controller
+
+- name: Set static IP (corp network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+               Sort-Object ifIndex | Select-Object -Last 1
+      New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+        -IPAddress 10.10.10.20 -PrefixLength 24 `
+        -ErrorAction SilentlyContinue
+      Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+        -ServerAddresses 127.0.0.1
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_feature:
+    name:
+      - AD-Domain-Services
+      - DNS
+      - RSAT-AD-PowerShell
+    state: present
+    include_management_tools: true
+
+- name: Promote DC02 to corp.local domain controller
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ADDSDeployment
+      Install-ADDSForest `
+        -DomainName "corp.local" `
+        -DomainNetbiosName "CORP" `
+        -SafeModeAdministratorPassword (ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force) `
+        -InstallDns:$true `
+        -Force:$true `
+        -NoRebootOnCompletion:$false
+
+- name: Wait for DC02 to reboot
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+
+- name: Create corp.local users and configure permissions
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/corp_attack_paths.ps1') }}"
+
+- name: Write DC02 flag
+  ansible.windows.win_copy:
+    content: "FLAG{corp_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt

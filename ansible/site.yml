@@ -1,0 +1,83 @@
+---
+# SnowCorp Lab — site.yml
+
+# ── Phase 1: Forest roots ──────────────────────────────────────────────────
+- name: Deploy DC01 (lab.local)
+  hosts: dc01
+  roles:
+    - dc01
+
+- name: Deploy DC02 (corp.local)
+  hosts: dc02
+  roles:
+    - dc02
+
+# ── Phase 2: Member machines join their domains ───────────────────────────
+- name: Configure WS01 (dual-homed, join lab.local)
+  hosts: ws01
+  roles:
+    - ws01
+
+- name: Configure WS02 (join corp.local)
+  hosts: ws02
+  roles:
+    - ws02
+
+# ── Phase 2b: Inter-domain routing ────────────────────────────────────────
+# WS01 is now up with IP forwarding enabled.
+# Add static routes and DNS conditional forwarders so DC01 and DC02
+# can reach each other — required for the forest trust in Phase 4.
+
+- name: Route lab.local -> corp.local via WS01
+  hosts: dc01
+  tasks:
+    - name: Add persistent route to corp.local network
+      ansible.windows.win_powershell:
+        script: |
+          route -p add 10.10.10.0 mask 255.255.255.0 192.168.136.11
+
+    - name: Add DNS conditional forwarder for corp.local
+      ansible.windows.win_powershell:
+        script: |
+          Add-DnsServerConditionalForwarderZone -Name "corp.local" `
+            -MasterServers 10.10.10.20 -ForwarderTimeout 5 -PassThru `
+            -ErrorAction SilentlyContinue
+
+- name: Route corp.local -> lab.local via WS01
+  hosts: dc02
+  tasks:
+    - name: Add persistent route to lab.local network
+      ansible.windows.win_powershell:
+        script: |
+          route -p add 192.168.136.0 mask 255.255.255.0 10.10.10.11
+
+    - name: Add DNS conditional forwarder for lab.local
+      ansible.windows.win_powershell:
+        script: |
+          Add-DnsServerConditionalForwarderZone -Name "lab.local" `
+            -MasterServers 192.168.136.10 -ForwarderTimeout 5 -PassThru `
+            -ErrorAction SilentlyContinue
+
+# ── Phase 3: Linux box ────────────────────────────────────────────────────
+- name: Configure UBU01 (NFS, sudo zip, flags)
+  hosts: ubu01
+  roles:
+    - ubu01
+
+# ── Phase 4: Cross-domain trust and ACLs ─────────────────────────────────
+# Routing and DNS are now in place — DC01 can reach DC02 for the trust.
+# WS02 has joined corp.local — WS02$ computer account now exists for ACLs.
+
+- name: Establish forest trust from lab.local side
+  hosts: dc01
+  tasks:
+    - name: Create bidirectional forest trust with corp.local
+      ansible.windows.win_powershell:
+        script: "{{ lookup('file', 'roles/dc01/files/forest_trust.ps1') }}"
+
+- name: Set corp.local ACLs (WS02$ now in AD)
+  hosts: dc02
+  tasks:
+    - name: Set sarah.jones GenericWrite on WS02$
+      ansible.windows.win_powershell:
+        script: "{{ lookup('file', 'roles/dc02/files/corp_acls.ps1') }}"

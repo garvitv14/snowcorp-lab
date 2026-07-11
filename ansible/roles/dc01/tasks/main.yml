@@ -1,0 +1,59 @@
+---
+# DC01 — lab.local Domain Controller
+
+- name: Set static IP (lab network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+               Sort-Object ifIndex | Select-Object -Last 1
+      New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+        -IPAddress 192.168.136.10 -PrefixLength 24 -DefaultGateway 192.168.136.1 `
+        -ErrorAction SilentlyContinue
+      Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+        -ServerAddresses 127.0.0.1
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_feature:
+    name:
+      - AD-Domain-Services
+      - DNS
+      - RSAT-AD-PowerShell
+      - RSAT-ADCS
+    state: present
+    include_management_tools: true
+
+- name: Promote DC01 to lab.local domain controller
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ADDSDeployment
+      Install-ADDSForest `
+        -DomainName "lab.local" `
+        -DomainNetbiosName "LAB" `
+        -SafeModeAdministratorPassword (ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force) `
+        -InstallDns:$true `
+        -Force:$true `
+        -NoRebootOnCompletion:$false
+
+- name: Wait for DC01 to reboot and become available
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+
+- name: Create lab.local users and groups
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/create_users.ps1') }}"
+
+- name: Install ADCS role
+  ansible.windows.win_feature:
+    name: ADCS-Cert-Authority
+    state: present
+    include_management_tools: true
+
+- name: Configure ADCS and certificate templates
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/configure_adcs.ps1') }}"
+
+- name: Write DC01 flag (readable only by Administrator)
+  ansible.windows.win_copy:
+    content: "FLAG{lab_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt

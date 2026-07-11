@@ -1,0 +1,35 @@
+---
+all:
+  children:
+
+    lab_domain:
+      hosts:
+        dc01:
+          ansible_host: 192.168.136.10
+        ws01:
+          ansible_host: 192.168.136.11
+
+    corp_domain:
+      hosts:
+        dc02:
+          ansible_host: 10.10.10.20
+        ws02:
+          ansible_host: 10.10.10.21
+
+    linux:
+      hosts:
+        ubu01:
+          ansible_host: 10.10.10.31
+
+    windows:
+      children:
+        lab_domain:
+        corp_domain:
+
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_port: 5985
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
