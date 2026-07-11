@@ -1,16 +1,17 @@
 .PHONY: up up-vmware down reset provision status ssh-ubu01 check check-vmware install install-vmware
 
-# Under WSL2, Vagrant and the hypervisor run on Windows, not inside WSL — this
-# calls vagrant.exe (via WSL interop) and looks for the hypervisor under
-# /mnt/c instead of expecting a Linux-side install. Same pattern GOAD uses.
+# Vagrant always runs as the Linux binary, including under WSL2 — it drives
+# ansible-playbook directly and needs to run where Ansible lives. Only the
+# hypervisor stays on Windows under WSL2, so its CLI name changes (found via
+# PATH — see install.sh, which adds the Windows install dir to ~/.bashrc).
 IS_WSL := $(shell grep -qi microsoft /proc/version 2>/dev/null && echo 1)
 
+VAGRANT := vagrant
+
 ifeq ($(IS_WSL),1)
-VAGRANT    := vagrant.exe
-VBOXMANAGE := /mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe
-VMRUN      := /mnt/c/Program Files (x86)/VMware/VMware Workstation/vmrun.exe
+VBOXMANAGE := VBoxManage.exe
+VMRUN      := vmrun.exe
 else
-VAGRANT    := vagrant
 VBOXMANAGE := VBoxManage
 VMRUN      := vmrun
 endif

@@ -317,30 +317,45 @@ vagrant provision ws01
 Ansible does not run on Windows natively, and nesting a hypervisor inside a VM
 (e.g. enabling "Virtualize Intel VT-x/EPT" on a Kali VM) is unreliable once
 Hyper-V is active — which it is by default if you use WSL2 or the Android
-emulator. So don't nest: install the hypervisor and Vagrant **on Windows
-itself** (one level under Hyper-V, which works fine), and drive them from
-WSL2 for Ansible.
+emulator. So don't nest: install the **hypervisor** on Windows itself (one
+level under Hyper-V, which works fine), but run **Vagrant and Ansible inside
+WSL2**. Per [HashiCorp's own docs](https://developer.hashicorp.com/vagrant/docs/other/wsl),
+`vagrant.exe` invoked from inside WSL "won't function correctly" — Vagrant
+has to be the Linux binary. That also matters here specifically: this repo's
+Vagrantfile uses Vagrant's built-in `ansible` provisioner, which shells out
+to `ansible-playbook` on whatever machine runs `vagrant` — so vagrant has to
+run where Ansible lives (WSL2), not as a Windows process.
 
 1. Install VirtualBox (or VMware Workstation) **on Windows**, not inside WSL2.
-2. Install Vagrant **on Windows**: https://developer.hashicorp.com/vagrant/downloads
-3. Clone this repo onto a **Windows-mounted drive**, not the WSL-only filesystem:
+2. Clone this repo onto a **Windows-mounted drive** (needed for synced folders):
    ```bash
    cd /mnt/c/Users/YourName/
    git clone https://github.com/garvitv14/snowcorp-lab
    cd snowcorp-lab
    ```
-4. Run the installer and lab from inside WSL2:
+3. Run the installer and lab from inside WSL2:
    ```bash
    make install          # or: make install-vmware
    make check            # or: make check-vmware
    make up                # or: make up-vmware
    ```
 
-`install.sh` and the `Makefile` auto-detect WSL2: they install Ansible inside
-WSL2, check for VirtualBox/VMware/Vagrant on the Windows side under `/mnt/c`,
-and call `vagrant.exe` (via WSL interop) instead of a Linux `vagrant` binary
-— so `make up` behaves the same as on native Linux/macOS. No
-`VAGRANT_WSL_ENABLE_WINDOWS_ACCESS` or manual `PATH` edits needed.
+`install.sh` auto-detects WSL2 and installs Vagrant + Ansible as native Linux
+binaries inside WSL2 (not on Windows). It also appends to `~/.bashrc`:
+`VAGRANT_WSL_ENABLE_WINDOWS_ACCESS=1` (grants WSL-side Vagrant access to
+Windows resources — HashiCorp calls this "required for proper
+functionality") and the Windows hypervisor's install directory on `PATH`, so
+Vagrant can shell out to `VBoxManage.exe`/`vmrun.exe`. Open a new shell (or
+`source ~/.bashrc`) after the first `make install` for these to take effect.
+The `Makefile` picks the right hypervisor CLI name automatically — `make up`
+behaves the same as on native Linux/macOS from there.
+
+If you'd rather not put `VAGRANT_HOME` on a Windows-mounted (DrvFs) path —
+DrvFs is noticeably slower for the many small files Vagrant/box caches
+write — set `VAGRANT_HOME` to a native WSL ext4 path (e.g.
+`export VAGRANT_HOME=~/.vagrant.d` before `VAGRANT_WSL_ENABLE_WINDOWS_ACCESS`
+normally auto-relocates it) and keep only the project checkout itself on
+`/mnt/c`.
 
 Your Kali attacker VM is unaffected by any of this — it doesn't need nested
 virtualisation either, it just needs a NIC on the lab's internal network (see
