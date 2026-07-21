@@ -1,0 +1,142 @@
+---
+# DC02 — corp.local Domain Controller
+
+# Every task below retries on failure — see dc01's role for the full
+# rationale (WinRM connections here intermittently drop mid-request under
+# host load, even on trivial sub-second commands, so retrying the
+# specific failed task in place is far faster and more reliable than
+# re-running the whole play from the top on every transient drop).
+
+- name: Set static IP (corp network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $allUp = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Sort-Object ifIndex
+      $iface = $allUp | Select-Object -Last 1
+      $alreadyCorrect = (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+          Where-Object { $_.IPAddress -eq '10.10.10.20' }) -and
+        ((Get-DnsClientServerAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4).ServerAddresses -contains '127.0.0.1')
+      # This task's own WinRM connection is routed through this exact
+      # adapter (via the netsh portproxy relay to its private IP) — if
+      # the config is already correct, skip entirely rather than
+      # re-running New-NetIPAddress/Set-DnsClientServerAddress, which
+      # briefly disrupts the adapter and self-drops the connection
+      # carrying this task's own result (observed: deterministic ~150s
+      # WinRM read-timeout on every replay, not fixed by retrying).
+      if (-not $alreadyCorrect) {
+        New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+          -IPAddress 10.10.10.20 -PrefixLength 24 `
+          -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+          -ServerAddresses 127.0.0.1
+        # See dc01's role for why: don't let the NAT adapter register its
+        # (unreachable-from-other-VMs) address into this DC's own zone.
+        $allUp | Where-Object { $_.ifIndex -ne $iface.ifIndex } | ForEach-Object {
+            Set-DnsClient -InterfaceIndex $_.ifIndex -RegisterThisConnectionsAddress $false
+        }
+      }
+  register: dc02_static_ip
+  retries: 5
+  delay: 10
+  until: dc02_static_ip is not failed
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_feature:
+    name:
+      - AD-Domain-Services
+      - DNS
+      - RSAT-AD-PowerShell
+    state: present
+    include_management_tools: true
+  register: dc02_addsdns_feature
+  retries: 5
+  delay: 10
+  until: dc02_addsdns_feature is not failed
+
+- name: Check whether this host is already a domain controller
+  ansible.windows.win_powershell:
+    script: (Get-CimInstance Win32_ComputerSystem).DomainRole
+  register: dc02_domain_role
+  retries: 5
+  delay: 10
+  until: dc02_domain_role is not failed
+
+- name: Set local Administrator password (blank fails domain promotion)
+  # See dc01's role for why this is needed.
+  ansible.windows.win_powershell:
+    script: |
+      $pw = ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force
+      Set-LocalUser -Name "Administrator" -Password $pw
+  when: dc02_domain_role.output[0] < 4
+  register: dc02_admin_pw
+  retries: 5
+  delay: 10
+  until: dc02_admin_pw is not failed
+
+- name: Promote DC02 to corp.local domain controller
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ADDSDeployment
+      Install-ADDSForest `
+        -DomainName "corp.local" `
+        -DomainNetbiosName "CORP" `
+        -SafeModeAdministratorPassword (ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force) `
+        -InstallDns:$true `
+        -Force:$true `
+        -NoRebootOnCompletion:$false
+  # See dc01's role for why this needs an idempotency guard and why it's
+  # NOT auto-retried on failure (dcpromo isn't safe to blindly re-run —
+  # the "Re-check domain role" step below determines real state instead,
+  # covering the case where this succeeded but the response was lost).
+  when: dc02_domain_role.output[0] < 4
+  register: dc02_promotion
+  ignore_errors: true
+
+- name: Wait for DC02 to reboot
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+  when: dc02_promotion is changed or dc02_promotion is failed
+
+- name: Re-check domain role after promotion attempt
+  ansible.windows.win_powershell:
+    script: (Get-CimInstance Win32_ComputerSystem).DomainRole
+  register: dc02_domain_role_post
+  retries: 5
+  delay: 10
+  until: dc02_domain_role_post is not failed
+
+- name: Fail cleanly if promotion didn't actually take
+  # See dc01's role for the full rationale — don't silently continue
+  # into AD-dependent steps against a host that isn't actually a DC yet.
+  ansible.builtin.fail:
+    msg: >-
+      DC02 is not a domain controller after the promotion step
+      (DomainRole={{ dc02_domain_role_post.output[0] }}, expected >= 4).
+      Investigate C:\Windows\debug\dcpromo*.log on the host before retrying.
+  when: dc02_domain_role_post.output[0] < 4
+
+- name: Create corp.local users and configure permissions
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/corp_attack_paths.ps1') }}"
+  register: dc02_users
+  retries: 5
+  delay: 10
+  until: dc02_users is not failed
+
+- name: Ensure Administrator's Desktop exists (lazily created on first logon)
+  ansible.windows.win_file:
+    path: C:\Users\Administrator\Desktop
+    state: directory
+  register: dc02_desktop
+  retries: 5
+  delay: 10
+  until: dc02_desktop is not failed
+
+- name: Write DC02 flag
+  ansible.windows.win_copy:
+    content: "FLAG{corp_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt
+  register: dc02_flag
+  retries: 5
+  delay: 10
+  until: dc02_flag is not failed

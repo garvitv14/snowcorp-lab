@@ -1,0 +1,204 @@
+---
+# WS01 — Dual-homed Windows 11 workstation
+
+# Every task below retries on failure — see dc01's role for the full
+# rationale (WinRM connections here intermittently drop mid-request under
+# host load, even on trivial sub-second commands, so retrying the
+# specific failed task in place is far faster and more reliable than
+# re-running the whole play from the top on every transient drop).
+
+- name: Rename computer to WS01
+  # scripts/import_windows11.sh imports this box straight from an OVF,
+  # bypassing Vagrant/sysprep's usual hostname assignment — it boots under
+  # whatever random name Windows Setup picked (e.g. DESKTOP-XXXXXXX). Left
+  # alone, it joins lab.local under that name instead of "WS01", so nothing
+  # downstream that references the computer by name (there isn't any today,
+  # but any future ACL/delegation script keyed on "WS01$" would silently
+  # target a nonexistent object).
+  ansible.windows.win_hostname:
+    name: WS01
+  register: ws01_rename
+  retries: 5
+  delay: 10
+  until: ws01_rename is not failed
+
+- name: Reboot after rename if needed
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when: ws01_rename.reboot_required
+
+- name: Set static IP on the lab-network adapter
+  # Vagrant's own `private_network` directive normally assigns this IP as
+  # part of its first-`vagrant up` guest network provisioning — but ws01
+  # is imported via scripts/import_windows11.sh (see that script and
+  # vagrant_up_resilient.sh for why: VBoxManage import from an OVF loses
+  # the box's EFI NVRAM otherwise), which brings the VM up outside
+  # vagrant's own boot flow entirely, so that step never runs. Without
+  # this, the adapter sits on a link-local/APIPA address (169.254.x.x)
+  # forever, every later task that looks for "the adapter with a
+  # 192.168.136.* address" finds nothing, and the domain join fails with
+  # "domain cannot be contacted" — DNS was never pointed at a real DC.
+  ansible.windows.win_powershell:
+    script: |
+      $target = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+          $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+          if ($ip -notlike "10.0.2.*" -and $ip -notlike "169.254.*" -and $ip -ne "192.168.136.11") {
+              $_
+          } elseif ($ip -like "169.254.*") {
+              $_
+          }
+      } | Select-Object -First 1
+      if ($target -and -not (Get-NetIPAddress -InterfaceIndex $target.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq "192.168.136.11" })) {
+          Remove-NetIPAddress -InterfaceIndex $target.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+          New-NetIPAddress -InterfaceIndex $target.ifIndex -IPAddress 192.168.136.11 -PrefixLength 24 -ErrorAction SilentlyContinue
+          Write-Host "[+] Set 192.168.136.11 on adapter ifIndex $($target.ifIndex)"
+      } else {
+          Write-Host "[+] Lab-network adapter already has 192.168.136.11"
+      }
+  register: ws01_lab_ip
+  retries: 5
+  delay: 10
+  until: ws01_lab_ip is not failed
+
+- name: Enable IP forwarding (WS01 bridges lab.local and corp.local networks)
+  ansible.windows.win_powershell:
+    script: |
+      Get-NetAdapter | ForEach-Object {
+          Set-NetIPInterface -InterfaceIndex $_.ifIndex -Forwarding Enabled -ErrorAction SilentlyContinue
+      }
+  register: ws01_ip_forwarding
+  retries: 5
+  delay: 10
+  until: ws01_ip_forwarding is not failed
+
+- name: Add corp-network IP to WS01 (dual-homed pivot)
+  ansible.windows.win_powershell:
+    script: |
+      $lab = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
+             Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 `
+               -ErrorAction SilentlyContinue).IPAddress -like "192.168.136.*" }
+      # WS01 only has one Vagrant-managed private_network adapter (see the
+      # Vagrantfile for why: a 2nd one crashes this box's Windows install on
+      # boot). It still needs to reach both lab.local and corp.local as a
+      # pivot host, so the corp address is added as a *second IP on the
+      # same adapter* instead of a second NIC.
+      New-NetIPAddress -InterfaceIndex $lab.ifIndex -IPAddress 10.10.10.11 `
+        -PrefixLength 24 -ErrorAction SilentlyContinue
+  register: ws01_corp_ip
+  retries: 5
+  delay: 10
+  until: ws01_corp_ip is not failed
+
+- name: Set DNS to DC01 for domain join
+  ansible.windows.win_powershell:
+    script: |
+      $up = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+      $lab = $up | Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 `
+               -ErrorAction SilentlyContinue).IPAddress -like "192.168.136.*" }
+      Set-DnsClientServerAddress -InterfaceIndex $lab.ifIndex -ServerAddresses 192.168.136.10
+      # See dc01's role for why: Vagrant's default NAT adapter shouldn't
+      # register its (unreachable-from-other-VMs) address into AD DNS —
+      # only the private-network adapter actually used for domain traffic
+      # should.
+      $up | Where-Object { $_.ifIndex -ne $lab.ifIndex } | ForEach-Object {
+          Set-DnsClient -InterfaceIndex $_.ifIndex -RegisterThisConnectionsAddress $false
+      }
+  register: ws01_dns
+  retries: 5
+  delay: 10
+  until: ws01_dns is not failed
+
+- name: Join WS01 to lab.local domain
+  microsoft.ad.membership:
+    dns_domain_name: lab.local
+    domain_admin_user: LAB\Administrator
+    domain_admin_password: "Admin@2026!"
+    state: domain
+    reboot: true
+    # The post-join reboot on a Windows 11 guest under nested virtualization
+    # (first domain logon, GPO processing) can take well over the module's
+    # 600s default — matches config.vm.boot_timeout's rationale in the
+    # Vagrantfile.
+    reboot_timeout: 1200
+  # This module checks current domain membership by contacting a DC before
+  # deciding whether to join. If this play runs right after WS01 itself
+  # just booted (e.g. a fresh `vagrant up` immediately followed by
+  # provisioning), Netlogon's secure channel to the DC isn't always
+  # established yet, and the check throws ("domain cannot be contacted")
+  # instead of either succeeding or cleanly reporting not-joined. Retrying
+  # after a short wait resolves it without masking a real failure — a
+  # genuinely unreachable DC will still exhaust the retries and fail.
+  register: ws01_domain_join
+  retries: 3
+  delay: 30
+  until: ws01_domain_join is not failed
+
+- name: Wait for WS01 to rejoin after domain reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 180
+
+- name: Add john.smith as Local Administrator on WS01
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - LAB\john.smith
+    state: present
+  register: ws01_admin_group
+  retries: 5
+  delay: 10
+  until: ws01_admin_group is not failed
+
+- name: Enable WinRM firewall rule
+  community.windows.win_firewall_rule:
+    name: WinRM HTTP
+    localport: 5985
+    action: allow
+    direction: in
+    protocol: tcp
+    state: present
+    enabled: true
+  register: ws01_firewall
+  retries: 5
+  delay: 10
+  until: ws01_firewall is not failed
+
+- name: Disable Windows Defender real-time protection (lab convenience)
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Set-MpPreference -DisableScriptScanning $true
+      Set-MpPreference -DisableBehaviorMonitoring $true
+  register: ws01_defender
+  retries: 5
+  delay: 10
+  until: ws01_defender is not failed
+
+- name: Create john.smith Documents folder and drop Ligolo agent placeholder
+  ansible.windows.win_file:
+    path: C:\Users\john.smith\Documents
+    state: directory
+  register: ws01_docs_folder
+  retries: 5
+  delay: 10
+  until: ws01_docs_folder is not failed
+
+- name: Register john.smith startup task
+  # The UNC path here must be a hostname, not a literal IP — a literal IP
+  # skips name resolution entirely and connects straight to it, which
+  # only works if the attacker happens to be at that exact address and
+  # never actually exercises LLMNR/NBT-NS poisoning. A nonexistent
+  # hostname fails DNS and falls back to LLMNR/NBT-NS broadcast (which
+  # Responder answers), so this works regardless of the attacker's IP —
+  # that's the intended mechanism.
+  ansible.windows.win_powershell:
+    script: |
+      $action  = New-ScheduledTaskAction -Execute "cmd.exe" `
+                   -Argument '/c pushd \\fileshare01\backups 2>nul & popd'
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User "LAB\john.smith"
+      Register-ScheduledTask -TaskName "MapNetDrive" -Action $action `
+        -Trigger $trigger -RunLevel Highest -Force | Out-Null
+  register: ws01_startup_task
+  retries: 5
+  delay: 10
+  until: ws01_startup_task is not failed

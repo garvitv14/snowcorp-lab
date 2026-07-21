@@ -1,0 +1,145 @@
+---
+# WS02 — corp.local workstation
+
+# Every task below retries on failure — see dc01's role for the full
+# rationale (WinRM connections here intermittently drop mid-request under
+# host load, so retrying the specific failed task in place is far faster
+# and more reliable than re-running the whole play from the top).
+
+- name: Rename computer to WS02
+  # scripts/import_windows11.sh imports this box straight from an OVF,
+  # bypassing Vagrant/sysprep's usual hostname assignment — it boots under
+  # whatever random name Windows Setup picked (e.g. DESKTOP-XXXXXXX), not
+  # "WS02". corp_acls.ps1 (further down the playbook) does
+  # `Get-ADComputer -Identity "WS02"` to grant sarah.jones GenericWrite and
+  # set TrustedForDelegation — with the default name still in place, that
+  # lookup fails and the whole sarah.jones -> WS02$ escalation step never
+  # actually gets applied.
+  ansible.windows.win_hostname:
+    name: WS02
+  register: ws02_rename
+  retries: 5
+  delay: 10
+  until: ws02_rename is not failed
+
+- name: Reboot after rename if needed
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when: ws02_rename.reboot_required
+
+- name: Set static IP on the corp-network adapter
+  # See ws01's role for the full rationale — ws02 is also imported via
+  # scripts/import_windows11.sh, bypassing vagrant's own first-boot
+  # `private_network` provisioning, so this adapter starts on a
+  # link-local/APIPA address instead of a real one unless set explicitly
+  # here.
+  ansible.windows.win_powershell:
+    script: |
+      $target = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+          $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+          if ($ip -notlike "10.0.2.*" -and $ip -notlike "169.254.*" -and $ip -ne "10.10.10.21") {
+              $_
+          } elseif ($ip -like "169.254.*") {
+              $_
+          }
+      } | Select-Object -First 1
+      if ($target -and -not (Get-NetIPAddress -InterfaceIndex $target.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq "10.10.10.21" })) {
+          Remove-NetIPAddress -InterfaceIndex $target.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+          New-NetIPAddress -InterfaceIndex $target.ifIndex -IPAddress 10.10.10.21 -PrefixLength 24 -ErrorAction SilentlyContinue
+          Write-Host "[+] Set 10.10.10.21 on adapter ifIndex $($target.ifIndex)"
+      } else {
+          Write-Host "[+] Corp-network adapter already has 10.10.10.21"
+      }
+  register: ws02_corp_ip
+  retries: 5
+  delay: 10
+  until: ws02_corp_ip is not failed
+
+- name: Set DNS to DC02 for domain join
+  ansible.windows.win_powershell:
+    script: |
+      $allUp = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+      $corp = $allUp | Where-Object { (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 `
+               -ErrorAction SilentlyContinue).IPAddress -like "10.10.10.*" }
+      Set-DnsClientServerAddress -InterfaceIndex $corp.ifIndex `
+        -ServerAddresses 10.10.10.20
+      # See dc01's role for why: don't let the NAT adapter register its
+      # (unreachable-from-other-VMs) address into AD DNS.
+      $allUp | Where-Object { $_.ifIndex -ne $corp.ifIndex } | ForEach-Object {
+          Set-DnsClient -InterfaceIndex $_.ifIndex -RegisterThisConnectionsAddress $false
+      }
+  register: ws02_dns
+  retries: 5
+  delay: 10
+  until: ws02_dns is not failed
+
+- name: Join WS02 to corp.local domain
+  microsoft.ad.membership:
+    dns_domain_name: corp.local
+    domain_admin_user: CORP\Administrator
+    domain_admin_password: "Admin@2026!"
+    state: domain
+    reboot: true
+    # See ws01's role for why: the post-join reboot can take well over the
+    # module's 600s default under nested virtualization.
+    reboot_timeout: 1200
+  # See ws01's role for why: Netlogon isn't always ready to verify domain
+  # membership immediately after a fresh boot.
+  register: ws02_domain_join
+  retries: 3
+  delay: 30
+  until: ws02_domain_join is not failed
+
+- name: Wait for WS02 to rejoin after domain reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 180
+
+- name: Add svc_deploy as local administrator on WS02
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - CORP\svc_deploy
+    state: present
+  register: ws02_admin_group
+  retries: 5
+  delay: 10
+  until: ws02_admin_group is not failed
+
+- name: Disable Windows Defender
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Set-MpPreference -DisableScriptScanning $true
+  register: ws02_defender
+  retries: 5
+  delay: 10
+  until: ws02_defender is not failed
+
+- name: Enable AutoAdminLogon for CORP\Administrator on WS02
+  # A scheduled task with -LogonType Interactive (the previous approach
+  # here) does NOT create a new logon session — that logon type only lets
+  # the task run if the target user *already* has an interactive session
+  # established some other way. It silently never fires a real Kerberos
+  # authentication, so no Administrator TGT ever ends up cached in LSASS,
+  # which is the entire point of WS02 having TrustedForDelegation set.
+  # AutoAdminLogon instead makes Winlogon itself perform a genuine
+  # interactive console logon for this account on every boot, the same as
+  # if someone typed the password at the console — that's a real Kerberos
+  # AS-REQ/AS-REP against DC02, so a real, delegatable TGT lands in memory
+  # every time this VM starts.
+  ansible.windows.win_powershell:
+    script: |
+      $path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+      Set-ItemProperty -Path $path -Name AutoAdminLogon -Value "1"
+      Set-ItemProperty -Path $path -Name DefaultUserName -Value "Administrator"
+      Set-ItemProperty -Path $path -Name DefaultDomainName -Value "CORP"
+      Set-ItemProperty -Path $path -Name DefaultPassword -Value "Admin@2026!"
+  register: ws02_autologon
+  retries: 5
+  delay: 10
+  until: ws02_autologon is not failed
+
+- name: Reboot WS02 to trigger the AutoAdminLogon (seeds a real cached TGT)
+  ansible.windows.win_reboot:
+    reboot_timeout: 600

@@ -1,0 +1,89 @@
+---
+# ansible_host/ansible_port below connect through a Windows-level
+# `netsh interface portproxy` relay (127.0.0.1:259xx -> each VM's private
+# IP), NOT VirtualBox's own NAT-forwarded ports (127.0.0.1:159xx). The
+# direct NAT ports were re-tried on 2026-07-19 and confirmed to degrade
+# under this project's own heavy/repeated connection use within a single
+# long session (a clean host, freshly booted VMs, work fine over NAT at
+# first — then the same port starts hanging with zero response after
+# enough accumulated connections), matching the original finding that
+# motivated this relay in the first place. Direct private IPs
+# (192.168.136.x/10.10.10.x) are unreachable from WSL entirely (WSL2 has
+# no route to that network). The portproxy relay works because WSL's own
+# reachability to Windows' 127.0.0.1 (WSL2 localhost-forwarding) is solid.
+# Recreate these if the VMs are ever destroyed/recreated with different
+# private IPs:
+#   netsh interface portproxy add v4tov4 listenport=<259xx> listenaddress=127.0.0.1 connectport=<5985|22> connectaddress=<private-ip>
+#
+# Known side effect: any task that reconfigures a host's own
+# private-network adapter (e.g. dc02's "Set static IP") runs that change
+# over a WinRM connection routed through that same adapter, and can
+# self-disrupt its own response — see the retries/until guard on those
+# specific tasks, which is the correct fix for that (not switching
+# connection paths — see git history for why that was tried and reverted).
+all:
+  children:
+
+    lab_domain:
+      hosts:
+        dc01:
+          ansible_host: 127.0.0.1
+          ansible_port: 25985
+        ws01:
+          ansible_host: 127.0.0.1
+          ansible_port: 25986
+
+    corp_domain:
+      hosts:
+        dc02:
+          ansible_host: 127.0.0.1
+          ansible_port: 25987
+        ws02:
+          ansible_host: 127.0.0.1
+          ansible_port: 25988
+
+    linux:
+      hosts:
+        ubu01:
+          ansible_host: 127.0.0.1
+          ansible_port: 25922
+          # Override the all-group winrm default below — ubu01 is the only
+          # non-Windows host and connects over SSH. Vagrant's own "ansible"
+          # provisioner supplies this key via ANSIBLE_SSH_ARGS automatically,
+          # but that only happens when ansible runs *through* vagrant — a
+          # direct `ansible-playbook` invocation (e.g. this project's retry
+          # wrapper) has no such injection, so the key path is pinned here
+          # instead to make both invocation paths work identically.
+          ansible_connection: ssh
+          ansible_ssh_private_key_file: "/c/Users/Admin/snowcorp-lab/.vagrant/machines/ubu01/virtualbox/private_key"
+          ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    windows:
+      children:
+        lab_domain:
+        corp_domain:
+
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    # Without this, the winrm connection plugin infers scheme from the
+    # *standard* WinRM port (5986 -> https, else http) — since we connect
+    # over a non-standard NAT-forwarded port (159xx) for a plain-HTTP
+    # listener, that inference picks https and fails with an SSL error.
+    ansible_winrm_scheme: http
+    # This lab commonly runs all 5 VMs on hosts with tight RAM headroom,
+    # where a host under momentary memory pressure can be slow enough to
+    # blow past pywinrm's fairly short defaults (~20s/30s), surfacing as a
+    # spurious "UNREACHABLE" / connection reset on an otherwise-healthy
+    # host. Give WinRM more room before giving up.
+    ansible_winrm_operation_timeout_sec: 280
+    ansible_winrm_read_timeout_sec: 300
+    # Separate from the WinRM operation/read timeouts above: this is how
+    # long Ansible waits for an `async:`-wrapped task (e.g. the ADCS
+    # install, which legitimately takes several minutes) to signal that it
+    # has *started* on the guest. Under this lab's host RAM pressure that
+    # can itself take a while, well past the ansible.windows default.
+    ansible_win_async_startup_timeout: 120

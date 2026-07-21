@@ -1,0 +1,8 @@
+# This project's scripts run under bash (WSL/Linux/macOS) — CRLF line
+# endings silently break them ("$'\r': command not found", or worse, a
+# syntax error swallowing the whole script) on any Windows checkout with
+# git's common core.autocrlf=true default. Force LF for anything bash
+# actually executes, regardless of the cloning machine's git config.
+Makefile text eol=lf
+*.sh text eol=lf
+install.sh text eol=lf

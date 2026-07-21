@@ -1,0 +1,234 @@
+---
+# DC01 — lab.local Domain Controller
+
+# Every task below retries on failure (5x, 10s apart). This lab's WinRM
+# connections (WSL -> NAT-forwarded port -> guest) intermittently drop
+# mid-request under host load — confirmed to hit even single-line,
+# sub-second PowerShell commands (e.g. a plain DomainRole check), not just
+# genuinely slow operations. That rules out "just make slow things async"
+# as a full fix: a fresh domain-role check can fail for the same reason a
+# multi-minute ADCS install can. Retrying the specific failed task in
+# place is far faster and more reliable than re-running the whole play
+# from the top on every transient drop.
+
+- name: Set static IP (lab network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $allUp = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Sort-Object ifIndex
+      $iface = $allUp | Select-Object -Last 1
+      $alreadyCorrect = (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+          Where-Object { $_.IPAddress -eq '192.168.136.10' }) -and
+        ((Get-DnsClientServerAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4).ServerAddresses -contains '127.0.0.1')
+      # This task's own WinRM connection is routed through this exact
+      # adapter (via the netsh portproxy relay to its private IP) — if
+      # the config is already correct, skip entirely rather than
+      # re-running New-NetIPAddress/Set-DnsClientServerAddress, which
+      # briefly disrupts the adapter and self-drops the connection
+      # carrying this task's own result (observed: deterministic ~150s
+      # WinRM read-timeout on every replay, not fixed by retrying).
+      if (-not $alreadyCorrect) {
+        New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+          -IPAddress 192.168.136.10 -PrefixLength 24 -DefaultGateway 192.168.136.1 `
+          -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+          -ServerAddresses 127.0.0.1
+        # Every VM here also has Vagrant's default NAT adapter (used for
+        # WinRM/SSH port-forwarding), which Windows registers into DNS by
+        # default just like any other "Up" adapter. Left alone, this DC ends
+        # up with two A records for its own name/zone apex — the real
+        # 192.168.136.x address and the NAT adapter's address, which is
+        # private to this one VM and unreachable from any other VM. Other
+        # machines resolving this DC's name can then intermittently get the
+        # unreachable address, breaking domain joins/replication. Only the
+        # adapter we just configured should register.
+        $allUp | Where-Object { $_.ifIndex -ne $iface.ifIndex } | ForEach-Object {
+            Set-DnsClient -InterfaceIndex $_.ifIndex -RegisterThisConnectionsAddress $false
+        }
+      }
+  register: dc01_static_ip
+  retries: 5
+  delay: 10
+  until: dc01_static_ip is not failed
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_feature:
+    name:
+      - AD-Domain-Services
+      - DNS
+      - RSAT-AD-PowerShell
+      - RSAT-ADCS
+    state: present
+    include_management_tools: true
+  register: dc01_addsdns_feature
+  retries: 5
+  delay: 10
+  until: dc01_addsdns_feature is not failed
+
+- name: Check whether this host is already a domain controller
+  ansible.windows.win_powershell:
+    script: (Get-CimInstance Win32_ComputerSystem).DomainRole
+  register: dc01_domain_role
+  retries: 5
+  delay: 10
+  until: dc01_domain_role is not failed
+
+- name: Set local Administrator password (blank fails domain promotion)
+  # The box ships with the built-in Administrator account's password
+  # blank (auth uses the separate "vagrant" account) — Install-ADDSForest
+  # refuses to promote with a blank local Administrator password, since
+  # that account becomes the domain Administrator. Harmless to (re)run;
+  # only matters before promotion.
+  ansible.windows.win_powershell:
+    script: |
+      $pw = ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force
+      Set-LocalUser -Name "Administrator" -Password $pw
+  when: dc01_domain_role.output[0] < 4
+  register: dc01_admin_pw
+  retries: 5
+  delay: 10
+  until: dc01_admin_pw is not failed
+
+- name: Promote DC01 to lab.local domain controller
+  ansible.windows.win_powershell:
+    script: |
+      Import-Module ADDSDeployment
+      Install-ADDSForest `
+        -DomainName "lab.local" `
+        -DomainNetbiosName "LAB" `
+        -SafeModeAdministratorPassword (ConvertTo-SecureString "Admin@2026!" -AsPlainText -Force) `
+        -InstallDns:$true `
+        -Force:$true `
+        -NoRebootOnCompletion:$false
+  # DomainRole 4/5 = Backup/Primary Domain Controller. Install-ADDSForest
+  # isn't idempotent — re-running vagrant provision after this already
+  # succeeded once would otherwise fail here ("Certificate Server is
+  # installed") since it can't promote an already-promoted DC. Not
+  # retried on failure: a genuinely failed/partial promotion shouldn't be
+  # blindly retried (see the "Fail cleanly" guard below), only a dropped
+  # WinRM connection while it was already succeeding should be — and that
+  # case is handled by "Re-check domain role" picking up the real state
+  # regardless of whether this task's own response made it back.
+  when: dc01_domain_role.output[0] < 4
+  register: dc01_promotion
+  ignore_errors: true
+
+- name: Wait for DC01 to reboot and become available
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+  when: dc01_promotion is changed or dc01_promotion is failed
+
+- name: Re-check domain role after promotion attempt
+  ansible.windows.win_powershell:
+    script: (Get-CimInstance Win32_ComputerSystem).DomainRole
+  register: dc01_domain_role_post
+  retries: 5
+  delay: 10
+  until: dc01_domain_role_post is not failed
+
+- name: Fail cleanly if promotion didn't actually take
+  # Guards against a real deadlock seen in practice: if a promotion
+  # attempt is interrupted/fails partway and the play isn't halted here,
+  # the "Install ADCS role" step below still runs unconditionally and
+  # installs the Certification Authority Windows feature — which then
+  # permanently blocks EVERY future Install-ADDSForest attempt ("Error:
+  # Certificate Server is installed"), since AD DS refuses to promote a
+  # machine that already has Certificate Services present. Stop here
+  # instead of silently continuing into that trap.
+  ansible.builtin.fail:
+    msg: >-
+      DC01 is not a domain controller after the promotion step
+      (DomainRole={{ dc01_domain_role_post.output[0] }}, expected >= 4).
+      Not proceeding to install ADCS — doing so would permanently block
+      future promotion attempts. Investigate C:\Windows\debug\dcpromo*.log
+      on the host before retrying.
+  when: dc01_domain_role_post.output[0] < 4
+
+- name: Create lab.local users and groups
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/create_users.ps1') }}"
+  register: dc01_users
+  retries: 5
+  delay: 10
+  until: dc01_users is not failed
+
+- name: Install ADCS role
+  ansible.windows.win_feature:
+    name: ADCS-Cert-Authority
+    state: present
+    include_management_tools: true
+  register: dc01_adcs_feature
+  retries: 5
+  delay: 10
+  until: dc01_adcs_feature is not failed
+
+- name: Add vagrant to Enterprise Admins (required to install an Enterprise Root CA)
+  # Ansible/WinRM connects as "vagrant", which is only in the local
+  # Administrators group post-promotion. Installing an Enterprise Root CA
+  # specifically requires Enterprise Admins — being a Domain/local
+  # Administrator isn't enough. Without this, Install-AdcsCertificationAuthority
+  # fails with "A value for the attribute was not in the acceptable range
+  # of values (ERROR_DS_RANGE_CONSTRAINT)", which does NOT surface as an
+  # obvious permissions error — CertOcm.log is what actually names it
+  # (ENUM_ENTERPRISE_UNAVAIL_REASON_NO_INSTALL_RIGHTS).
+  ansible.windows.win_powershell:
+    script: |
+      if (-not (Get-ADGroupMember -Identity "Enterprise Admins" | Where-Object { $_.SamAccountName -eq "vagrant" })) {
+        Add-ADGroupMember -Identity "Enterprise Admins" -Members vagrant
+        Write-Host "[+] vagrant added to Enterprise Admins"
+      } else {
+        Write-Host "[+] vagrant already in Enterprise Admins"
+      }
+  register: dc01_enterprise_admin
+  retries: 5
+  delay: 10
+  until: dc01_enterprise_admin is not failed
+
+- name: Configure ADCS and certificate templates
+  # Install-AdcsCertificationAuthority can take well over the WinRM
+  # read-timeout on a nested-virtualization host — run it async so a slow
+  # host doesn't get its WinRM connection (and the in-progress CA install
+  # along with it) torn down mid-operation.
+  #
+  # become/become_user Administrator is required here: WinRM connects as
+  # "vagrant", and even though the previous task just added vagrant to
+  # Enterprise Admins, that membership shows up in this session's token
+  # as "deny only" (Windows UAC/Admin-Approval-Mode token filtering
+  # applies to any account in a privileged group except the built-in
+  # Administrator). Without this, Set-ADObject/Add-CATemplate against
+  # the CA's config-partition object fails with "Insufficient access
+  # rights" or "CERTSRV_E_UNSUPPORTED_CERT_TYPE" despite the group
+  # membership being real — confirmed by comparing `whoami /groups`
+  # under vagrant (deny only) vs Administrator (enabled) for the exact
+  # same Enterprise Admins SID.
+  become: yes
+  become_method: runas
+  become_user: Administrator
+  vars:
+    ansible_become_password: "Admin@2026!"
+  ansible.windows.win_powershell:
+    script: "{{ lookup('file', 'files/configure_adcs.ps1') }}"
+  async: 900
+  poll: 15
+  register: dc01_adcs_configure
+  retries: 3
+  delay: 15
+  until: dc01_adcs_configure is not failed
+
+- name: Ensure Administrator's Desktop exists (lazily created on first logon)
+  ansible.windows.win_file:
+    path: C:\Users\Administrator\Desktop
+    state: directory
+  register: dc01_desktop
+  retries: 5
+  delay: 10
+  until: dc01_desktop is not failed
+
+- name: Write DC01 flag (readable only by Administrator)
+  ansible.windows.win_copy:
+    content: "FLAG{lab_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt
+  register: dc01_flag
+  retries: 5
+  delay: 10
+  until: dc01_flag is not failed
