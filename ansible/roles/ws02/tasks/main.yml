@@ -1,0 +1,90 @@
+---
+# WS02 — corp.local workstation
+
+# Vagrant's vm.hostname setting doesn't reliably take effect on this box
+# before this role runs - confirmed by direct testing (2026-07-27) that
+# WS02 joined corp.local under its box's default name (DESKTOP-2RVFQA9),
+# not "WS02". That's not cosmetic: roles/dc02/files/corp_acls.ps1 hardcodes
+# Get-ADComputer -Identity "WS02" to set sarah.jones' GenericWrite ACE for
+# the resource-based constrained delegation attack path, so a mismatched
+# hostname silently breaks that path. Set the name explicitly and reboot
+# before joining the domain rather than relying on Vagrant for it.
+- name: Ensure computer name is WS02
+  ansible.windows.win_hostname:
+    name: WS02
+  register: ws02_hostname
+
+- name: Reboot if hostname changed
+  ansible.windows.win_reboot:
+  when: ws02_hostname.reboot_required
+
+# Picking the adapter by "highest ifIndex" assumed the private-network NIC
+# always enumerates after the NAT one - confirmed by direct testing
+# (2026-07-26) that this doesn't hold on every host: WS02 had NAT
+# ("Ethernet") at ifIndex 7 and the real corp-network NIC ("Ethernet 2") at
+# ifIndex 3, so this picked NAT and set the corp DNS server on the one
+# adapter that can never route to it (only reachable via the default
+# gateway, which knows nothing about 10.10.10.0/24) - every subsequent
+# default-resolver DNS query silently timed out (explicit -Server queries
+# and nslookup still worked, since those don't depend on which adapter
+# "owns" the configured server). Identify the adapter by its actual IP
+# range instead - EnsurePrivateNetworkIPs.ps1 already assigned 10.10.10.21
+# to the real adapter earlier in the pipeline, so this is reliable
+# regardless of enumeration order.
+- name: Set DNS to DC02 for domain join
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetIPAddress -AddressFamily IPv4 -IPAddress "10.10.10.*" -ErrorAction Stop |
+               Select-Object -First 1 -ExpandProperty InterfaceIndex
+      Set-DnsClientServerAddress -InterfaceIndex $iface `
+        -ServerAddresses 10.10.10.20
+
+- name: Join WS02 to corp.local domain
+  microsoft.ad.membership:
+    dns_domain_name: corp.local
+    domain_admin_user: CORP\Administrator
+    domain_admin_password: "Adminpass2026x"
+    state: domain
+    reboot: true
+
+- name: Wait for WS02 to rejoin after domain reboot
+  ansible.builtin.wait_for_connection:
+    delay: 30
+    timeout: 180
+
+- name: Configure WS02 AD settings
+  ansible.windows.win_powershell:
+    script: |
+      $cred = New-Object System.Management.Automation.PSCredential(
+          "CORP\Administrator",
+          (ConvertTo-SecureString "Adminpass2026x" -AsPlainText -Force)
+      )
+      Invoke-Command -ComputerName 10.10.10.20 -Credential $cred -ScriptBlock {
+          Set-ADComputer -Identity "WS02" -TrustedForDelegation $true
+      }
+
+- name: Add svc_deploy as local administrator on WS02
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - CORP\svc_deploy
+    state: present
+
+- name: Disable Windows Defender
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Set-MpPreference -DisableScriptScanning $true
+
+- name: Register Administrator startup task on WS02
+  ansible.windows.win_powershell:
+    script: |
+      $pass = ConvertTo-SecureString "Adminpass2026x" -AsPlainText -Force
+      $cred = New-Object System.Management.Automation.PSCredential("CORP\Administrator", $pass)
+      $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                     -Argument '-WindowStyle Hidden -Command "Start-Sleep 10"'
+      $trigger   = New-ScheduledTaskTrigger -AtStartup
+      $principal = New-ScheduledTaskPrincipal -UserId "CORP\Administrator" `
+                     -LogonType Interactive -RunLevel Highest
+      Register-ScheduledTask -TaskName "AdminStartup" -Action $action `
+        -Trigger $trigger -Principal $principal -Force | Out-Null

@@ -1,0 +1,139 @@
+---
+# SnowCorp Lab — site.yml
+
+# ── Phase 1: Forest roots ──────────────────────────────────────────────────
+- name: Deploy DC01 (lab.local)
+  hosts: dc01
+  gather_facts: false
+  tags: role
+  roles:
+    - dc01
+
+- name: Deploy DC02 (corp.local)
+  hosts: dc02
+  gather_facts: false
+  tags: role
+  roles:
+    - dc02
+
+# ── Phase 2: Member machines join their domains ───────────────────────────
+- name: Configure WS01 (dual-homed, join lab.local)
+  hosts: ws01
+  gather_facts: false
+  tags: role
+  roles:
+    - ws01
+
+- name: Configure WS02 (join corp.local)
+  hosts: ws02
+  gather_facts: false
+  tags: role
+  roles:
+    - ws02
+
+# ── Phase 2b: Inter-domain routing ────────────────────────────────────────
+# WS01 is now up with IP forwarding enabled.
+# Add static routes and DNS conditional forwarders so DC01 and DC02
+# can reach each other — required for the forest trust in Phase 4.
+
+- name: Route lab.local -> corp.local via WS01
+  hosts: dc01
+  gather_facts: false
+  tags: crossdomain
+  tasks:
+    - name: Add persistent route to corp.local network
+      ansible.windows.win_powershell:
+        script: |
+          route -p add 10.10.10.0 mask 255.255.255.0 192.168.136.11
+
+    - name: Add DNS conditional forwarder for corp.local
+      ansible.windows.win_powershell:
+        script: |
+          Add-DnsServerConditionalForwarderZone -Name "corp.local" `
+            -MasterServers 10.10.10.20 -ForwarderTimeout 5 -PassThru `
+            -ErrorAction SilentlyContinue
+
+- name: Route corp.local -> lab.local via WS01
+  hosts: dc02
+  gather_facts: false
+  tags: crossdomain
+  tasks:
+    - name: Add persistent route to lab.local network
+      ansible.windows.win_powershell:
+        script: |
+          route -p add 192.168.136.0 mask 255.255.255.0 10.10.10.11
+
+    - name: Add DNS conditional forwarder for lab.local
+      ansible.windows.win_powershell:
+        script: |
+          Add-DnsServerConditionalForwarderZone -Name "lab.local" `
+            -MasterServers 192.168.136.10 -ForwarderTimeout 5 -PassThru `
+            -ErrorAction SilentlyContinue
+
+# ── Phase 3: Linux box ────────────────────────────────────────────────────
+- name: Configure UBU01 (NFS, sudo zip, flags)
+  hosts: ubu01
+  gather_facts: false
+  become: true
+  tags: role
+  roles:
+    - ubu01
+
+# ── Phase 4: Cross-domain trust and ACLs ─────────────────────────────────
+# Routing and DNS are now in place — DC01 can reach DC02 for the trust.
+# WS02 has joined corp.local — WS02$ computer account now exists for ACLs.
+
+- name: Establish forest trust from lab.local side
+  hosts: dc01
+  gather_facts: false
+  tags: crossdomain
+  tasks:
+    # Forest.CreateLocalSideOfTrustRelationship() requires the calling
+    # process itself to be running as a genuine Enterprise Admin (not just
+    # passed as credentials to a DirectoryContext) - confirmed via testing:
+    # identical call as `vagrant` (only BUILTIN\Administrators, not
+    # Enterprise Admins) throws Access Denied; as Administrator it succeeds.
+    # ansible connects as vagrant, so this task must runas Administrator.
+    #
+    # Cross-forest trust negotiation is a real network operation (LDAP/RPC
+    # round-trips to the OTHER domain's DC) that can genuinely take longer
+    # than a single WinRM connection's read timeout - confirmed by direct
+    # testing (2026-07-27) that this specific task (become+runas, which
+    # appears to use its own connection context that doesn't inherit
+    # inventory's extended ansible_winrm_read_timeout_sec) hit a bare 150s
+    # timeout mid-operation more than once. async+poll sidesteps this
+    # entirely: the command runs as a backgrounded job on the remote side,
+    # and each poll is its own short-lived connection, so no single
+    # connection needs to stay open for the full duration.
+    - name: Create bidirectional forest trust with corp.local
+      ansible.windows.win_shell: "{{ lookup('file', 'roles/dc01/files/forest_trust.ps1') }}"
+      become: true
+      become_method: runas
+      become_user: Administrator
+      async: 600
+      poll: 15
+      vars:
+        ansible_become_password: "Adminpass2026x"
+
+- name: Set corp.local ACLs (WS02$ now in AD)
+  hosts: dc02
+  gather_facts: false
+  tags: crossdomain
+  tasks:
+    # See the lab.local side's equivalent task for why async/poll is needed
+    # here too - same become+runas connection context, same class of
+    # cross-forest network operation that can outlast a single connection's
+    # read timeout.
+    - name: Create bidirectional forest trust with lab.local
+      ansible.windows.win_shell: "{{ lookup('file', 'roles/dc02/files/forest_trust_corp.ps1') }}"
+      become: true
+      become_method: runas
+      become_user: Administrator
+      async: 600
+      poll: 15
+      vars:
+        ansible_become_password: "Adminpass2026x"
+
+    - name: Set sarah.jones GenericWrite on WS02$
+      ansible.windows.win_powershell:
+        script: "{{ lookup('file', 'roles/dc02/files/corp_acls.ps1') }}"

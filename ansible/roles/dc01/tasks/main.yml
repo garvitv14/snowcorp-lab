@@ -1,0 +1,196 @@
+---
+# DC01 — lab.local Domain Controller
+
+# Picking the adapter by "highest ifIndex" assumed the private-network NIC
+# always enumerates after the NAT one - confirmed by direct testing
+# (2026-07-26) that this doesn't hold on every host (WS02 had it backwards,
+# silently misconfiguring its DNS server on the NAT adapter instead).
+# Identify the adapter reliably instead: the NAT adapter always gets a
+# default route (0.0.0.0/0) via its own DHCP-assigned gateway, while a
+# fresh private_network adapter never has one until we assign it - so the
+# adapter with no default route is the one we want, regardless of
+# enumeration order.
+- name: Set static IP (lab network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Where-Object {
+        -not (Get-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+      } | Select-Object -First 1
+      New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+        -IPAddress 192.168.136.10 -PrefixLength 24 -DefaultGateway 192.168.136.1 `
+        -ErrorAction SilentlyContinue
+      Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+        -ServerAddresses 127.0.0.1
+
+- name: Set local Administrator password (blank password blocks domain promotion)
+  ansible.windows.win_user:
+    name: Administrator
+    password: "Adminpass2026x"
+    password_never_expires: true
+    state: present
+
+- name: Install AD DS and DNS roles
+  ansible.windows.win_feature:
+    name:
+      - AD-Domain-Services
+      - DNS
+      - RSAT-AD-PowerShell
+      - RSAT-ADCS
+    state: present
+    include_management_tools: true
+
+- name: Check if DC01 is already a domain controller
+  ansible.windows.win_powershell:
+    script: |
+      # Checking mere service *existence* isn't enough - Install-ADDSForest
+      # registers the NTDS service before the promotion itself completes,
+      # so an interrupted/failed prior attempt leaves NTDS present but
+      # Stopped/Disabled (confirmed by direct testing, 2026-07-26). That
+      # made this check think DC01 was already promoted and skip
+      # re-running Install-ADDSForest forever, while every later task that
+      # needs a real, running DC kept failing with ADServerDownException.
+      # Require it actually running.
+      $svc = Get-Service NTDS -ErrorAction SilentlyContinue
+      $null -ne $svc -and $svc.Status -eq 'Running'
+  register: dc01_ntds_check
+
+# win_powershell's action plugin polls over its own WinRM connection with a
+# fixed ~150s read timeout that doesn't inherit inventory's
+# ansible_winrm_read_timeout_sec (confirmed by direct testing - it fails
+# with that literal error partway through a run that ran far longer than
+# 150s total). win_shell doesn't use that polling model and survives much
+# longer in the same test, so long-running scripts use it instead.
+- name: Promote DC01 to lab.local domain controller
+  ansible.windows.win_shell: |
+    Import-Module ADDSDeployment
+    Install-ADDSForest `
+      -DomainName "lab.local" `
+      -DomainNetbiosName "LAB" `
+      -SafeModeAdministratorPassword (ConvertTo-SecureString "Adminpass2026x" -AsPlainText -Force) `
+      -InstallDns:$true `
+      -Force:$true `
+      -NoRebootOnCompletion:$false
+  when: not dc01_ntds_check.output[0]
+
+- name: Wait for DC01 to reboot and become available
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+
+# Confirmed by direct testing (2026-07-26): after a domain promotion whose
+# path wasn't a single clean unattended Install-ADDSForest run (e.g. one
+# retried after an earlier interrupted attempt), the "lab.local" forward DNS
+# zone can be left missing entirely - only the default placeholder reverse
+# zones (0.in-addr.arpa etc.) exist. DNS then answers nothing for lab.local
+# or its SRV records, and every domain-join attempt from another machine
+# fails with "The specified domain either does not exist or could not be
+# contacted" even though the domain itself is fully promoted and reachable.
+# Idempotent - Add-ADDnsServerZone/-ErrorAction SilentlyContinue no-ops if
+# the zone already exists, and restarting Netlogon to force SRV
+# re-registration is cheap and harmless either way.
+- name: Ensure lab.local DNS zone exists
+  ansible.windows.win_powershell:
+    script: |
+      if (-not (Get-DnsServerZone -Name "lab.local" -ErrorAction SilentlyContinue)) {
+        Add-DnsServerPrimaryZone -Name "lab.local" -ReplicationScope "Forest"
+        Restart-Service Netlogon -Force
+        Start-Sleep -Seconds 5
+      }
+
+# Confirmed by direct testing (2026-07-26): after a fresh Install-ADDSForest
+# promotion + reboot, NTDS itself comes up Running/Automatic as expected,
+# but Active Directory Web Services (ADWS - what every AD PowerShell cmdlet
+# actually talks to, including all of New-ADUser/Add-ADGroupMember/etc.
+# below) can be left Stopped/Disabled instead of starting automatically.
+# Every AD cmdlet fails with "Unable to find a default server with Active
+# Directory Web Services running" (ADServerDownException) until this is
+# fixed - idempotent and harmless if ADWS is already fine.
+- name: Ensure Active Directory Web Services is running
+  ansible.windows.win_service:
+    name: ADWS
+    start_mode: auto
+    state: started
+
+- name: Create lab.local users and groups
+  ansible.windows.win_shell: "{{ lookup('file', 'files/create_users.ps1') }}"
+
+- name: Install ADCS role
+  ansible.windows.win_feature:
+    name: ADCS-Cert-Authority
+    state: present
+    include_management_tools: true
+
+- name: Check if ADCS is already configured
+  ansible.windows.win_powershell:
+    script: |
+      $null -ne (Get-Service CertSvc -ErrorAction SilentlyContinue)
+  register: dc01_adcs_check
+
+# Install-AdcsCertificationAuthority (inside configure_adcs.ps1) is not
+# idempotent - re-running it against an already-configured CA fails with
+# ERROR_DS_RANGE_CONSTRAINT and cascades into template-creation errors.
+# Confirmed happening on a re-provision of a VM that already had ADCS
+# configured from an earlier run (e.g. after a poweroff/power-on cycle).
+- name: Configure ADCS and certificate templates
+  ansible.windows.win_shell: "{{ lookup('file', 'files/configure_adcs.ps1') }}"
+  when: not dc01_adcs_check.output[0]
+
+- name: Ensure Administrator's profile directory exists (never logged in interactively)
+  ansible.windows.win_file:
+    path: C:\Users\Administrator\Desktop
+    state: directory
+
+# The ACL restriction below locks this file to SYSTEM + Domain Admins only -
+# but "vagrant" (the account this whole playbook connects as) isn't a
+# Domain Admin, so a re-run of this same playbook (e.g. re-provisioning an
+# already-configured VM) can no longer even READ the file to check its
+# content, and win_copy fails outright ("Access...is denied") instead of
+# just reporting no change needed. Confirmed by direct testing (2026-07-27).
+# Explicitly grant access back before writing, every time - the ACL-reset
+# task further below wipes ALL explicit ACEs (including this one)
+# regardless of what's there beforehand, so this stays idempotent no matter
+# what state a previous run left behind. Using the bare "vagrant" account
+# name here fails once DC01 is a promoted domain controller - confirmed by
+# direct testing (2026-07-27) that plain local account names aren't
+# reliably SID-translatable anymore at that point ("cannot get SID: Some or
+# all identity references could not be translated"). BUILTIN\Administrators
+# sidesteps this - "vagrant" is confirmed a member of it either way.
+- name: Ensure flag file is accessible before update (idempotency guard)
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: "BUILTIN\\Administrators"
+    rights: FullControl
+    type: allow
+    state: present
+  ignore_errors: true
+
+- name: Write DC01 flag (readable only by Domain Admins)
+  ansible.windows.win_copy:
+    content: "FLAG{lab_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt
+
+# win_copy's own default permissions leave the file readable by any account
+# with WinRM access to the box (e.g. the local "vagrant" account) - not just
+# whoever has actually compromised the domain, defeating the point of the
+# flag. Strip inherited ACEs and grant only SYSTEM + Domain Admins.
+- name: Remove inherited permissions from DC01 flag
+  ansible.windows.win_acl_inheritance:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    state: absent
+    reorganize: false
+
+- name: Grant SYSTEM full control on DC01 flag
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: SYSTEM
+    rights: FullControl
+    type: allow
+    state: present
+
+- name: Grant Domain Admins read access on DC01 flag
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: "LAB\\Domain Admins"
+    rights: Read
+    type: allow
+    state: present

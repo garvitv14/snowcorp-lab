@@ -1,0 +1,38 @@
+---
+# ansible_ssh_private_key_file previously used lookup('first_found', [...])
+# with paths relative to the repo root, but Ansible resolves relative
+# lookup paths against the playbook's own directory (ansible/), not the
+# repo root - so it always resolved to an empty string, silently causing
+# ssh to attempt (and fail) key auth with no identity file.
+# Tried falling back to ansible_password (set in inventory.yml) + sshpass
+# (confirmed installed) instead, but confirmed via -vvvv that this ansible
+# version's ssh connection plugin never invokes sshpass for this host even
+# with ansible_password set - the plain `ssh` command it runs has no
+# password mechanism at all. Real, reliable fix: anchor the key lookup to
+# playbook_dir (the directory of the running playbook, ansible/), which
+# resolves correctly for any user regardless of clone location - unlike a
+# bare relative path.
+#
+# Vagrant only writes a per-machine key file (.vagrant/machines/ubu01/.../
+# private_key) after it successfully rotates the box's shared insecure key
+# on first connect - confirmed by direct testing (2026-07-27) that this
+# doesn't always happen for this box, leaving no per-machine key file at
+# all and this whole lookup resolving empty again, with the exact same
+# silent "no identity file" failure the comment above already describes.
+# ~/.vagrant.d/insecure_private_key is the box's shared default key and
+# always exists once `vagrant up` has run at all - list it last as a
+# fallback so there's always a valid key regardless of whether rotation
+# happened.
+ansible_connection: ssh
+ansible_port: 22
+ansible_user: vagrant
+ansible_ssh_private_key_file: "{{ lookup('first_found', [playbook_dir + '/../.vagrant/machines/ubu01/vmware_desktop/private_key', playbook_dir + '/../.vagrant/machines/ubu01/virtualbox/private_key', '~/.vagrant.d/insecure_private_key'], errors='ignore') }}"
+# StrictHostKeyChecking=no alone only covers a host SSH has never seen
+# before - it does NOT bypass a CHANGED key (still treated as a possible
+# MITM attack and rejected outright, confirmed by direct testing,
+# 2026-07-27: "REMOTE HOST IDENTIFICATION HAS CHANGED... Permission denied
+# (publickey)"). This host's key changes every time the VM is rebuilt, so
+# also point known_hosts at /dev/null - with nothing to compare against,
+# every connection looks "new" instead of "changed", which is the whole
+# point for a disposable lab VM.
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"

@@ -1,0 +1,147 @@
+---
+# DC02 — corp.local Domain Controller
+
+# See dc01's role for why this can't rely on ifIndex ordering - the NAT
+# adapter always has a default route (0.0.0.0/0) via DHCP, a fresh
+# private_network adapter never does until assigned one, so that's the
+# reliable signal regardless of enumeration order.
+- name: Set static IP (corp network interface)
+  ansible.windows.win_powershell:
+    script: |
+      $iface = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Where-Object {
+        -not (Get-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+      } | Select-Object -First 1
+      New-NetIPAddress -InterfaceIndex $iface.ifIndex `
+        -IPAddress 10.10.10.20 -PrefixLength 24 `
+        -ErrorAction SilentlyContinue
+      Set-DnsClientServerAddress -InterfaceIndex $iface.ifIndex `
+        -ServerAddresses 127.0.0.1
+
+- name: Set local Administrator password (blank password blocks domain promotion)
+  ansible.windows.win_user:
+    name: Administrator
+    password: "Adminpass2026x"
+    password_never_expires: true
+    state: present
+
+# win_feature's action plugin polls over its own WinRM connection with the
+# same fixed ~150s read timeout as win_powershell (see dc01's role) and a
+# first-time install of these roles reliably takes longer than that -
+# confirmed by repeated failures at this exact task with the same
+# read-timeout=150 signature, while dc01 (roles already installed) never
+# hits it. win_shell doesn't use that polling model, so use it here too.
+- name: Install AD DS and DNS roles
+  ansible.windows.win_shell: |
+    Install-WindowsFeature -Name AD-Domain-Services, DNS, RSAT-AD-PowerShell -IncludeManagementTools
+
+- name: Check if DC02 is already a domain controller
+  ansible.windows.win_powershell:
+    script: |
+      # Get-Service NTDS alone is not a reliable idempotency signal: the
+      # NTDS service entry is created the moment the AD-Domain-Services
+      # Windows feature is installed (the task above), long before
+      # Install-ADDSForest actually promotes the machine - and after a real
+      # promotion, the local (non-domain) account this connects as loses
+      # visibility into NTDS entirely (Get-Service reports "not found", not
+      # even "stopped" - confirmed via direct testing, Directory Service
+      # event log showed NTDS genuinely running while this same account's
+      # Get-Service call still couldn't see it). PartOfDomain from
+      # Win32_ComputerSystem is a plain WMI property with no such
+      # visibility restriction, so it's the only reliable check here.
+      (Get-CimInstance Win32_ComputerSystem).PartOfDomain
+  register: dc02_ntds_check
+
+# See dc01's role for why long-running scripts use win_shell instead of
+# win_powershell (the latter's polling connection doesn't inherit the
+# extended WinRM read timeout and fails on long operations regardless).
+- name: Promote DC02 to corp.local domain controller
+  ansible.windows.win_shell: |
+    Import-Module ADDSDeployment
+    Install-ADDSForest `
+      -DomainName "corp.local" `
+      -DomainNetbiosName "CORP" `
+      -SafeModeAdministratorPassword (ConvertTo-SecureString "Adminpass2026x" -AsPlainText -Force) `
+      -InstallDns:$true `
+      -Force:$true `
+      -NoRebootOnCompletion:$false
+  when: not dc02_ntds_check.output[0]
+
+- name: Wait for DC02 to reboot
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    timeout: 300
+
+# See dc01's role for why this is needed - a promotion that wasn't a single
+# clean unattended Install-ADDSForest run can leave the forward DNS zone
+# missing entirely, breaking every domain-join attempt against this DC.
+- name: Ensure corp.local DNS zone exists
+  ansible.windows.win_powershell:
+    script: |
+      if (-not (Get-DnsServerZone -Name "corp.local" -ErrorAction SilentlyContinue)) {
+        Add-DnsServerPrimaryZone -Name "corp.local" -ReplicationScope "Forest"
+        Restart-Service Netlogon -Force
+        Start-Sleep -Seconds 5
+      }
+
+# See dc01's role for why this is needed - Active Directory Web Services
+# can be left Stopped/Disabled after a fresh promotion even though NTDS
+# itself comes up fine, and every AD cmdlet below depends on it.
+- name: Ensure Active Directory Web Services is running
+  ansible.windows.win_service:
+    name: ADWS
+    start_mode: auto
+    state: started
+
+- name: Create corp.local users and configure permissions
+  ansible.windows.win_shell: "{{ lookup('file', 'files/corp_attack_paths.ps1') }}"
+
+- name: Ensure Administrator's profile directory exists (never logged in interactively)
+  ansible.windows.win_file:
+    path: C:\Users\Administrator\Desktop
+    state: directory
+
+# See dc01's role for why this is needed - the ACL restriction further
+# below locks this file to SYSTEM + Domain Admins only, but a bare local
+# account name isn't reliably SID-translatable anymore once this machine
+# is a promoted domain controller. BUILTIN\Administrators sidesteps this -
+# "vagrant" is confirmed a member of it either way. Grant access back
+# before writing, every time - it gets wiped again immediately after
+# regardless, so this stays idempotent no matter what a previous run left.
+- name: Ensure flag file is accessible before update (idempotency guard)
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: "BUILTIN\\Administrators"
+    rights: FullControl
+    type: allow
+    state: present
+  ignore_errors: true
+
+- name: Write DC02 flag
+  ansible.windows.win_copy:
+    content: "FLAG{corp_local_da_owned}\r\n"
+    dest: C:\Users\Administrator\Desktop\flag.txt
+
+# See dc01's role for why this is needed - win_copy's default permissions
+# leave the file readable by any account with WinRM access (e.g. "vagrant"),
+# not just whoever has actually compromised the domain.
+- name: Remove inherited permissions from DC02 flag
+  ansible.windows.win_acl_inheritance:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    state: absent
+    reorganize: false
+
+- name: Grant SYSTEM full control on DC02 flag
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: SYSTEM
+    rights: FullControl
+    type: allow
+    state: present
+
+- name: Grant Domain Admins read access on DC02 flag
+  ansible.windows.win_acl:
+    path: C:\Users\Administrator\Desktop\flag.txt
+    user: "CORP\\Domain Admins"
+    rights: Read
+    type: allow
+    state: present

@@ -1,0 +1,11 @@
+# These scripts run inside WSL/Linux bash, which chokes on CRLF (heredocs,
+# `set -e`, function braces all break on an embedded \r). Without this,
+# Windows' Git default (core.autocrlf=true) silently converts them to CRLF
+# on checkout, breaking install.sh for every Windows user who clones the repo.
+*.sh text eol=lf
+Makefile text eol=lf
+ansible/**/*.yml text eol=lf
+ansible/**/*.yaml text eol=lf
+
+# These run on the Windows guest VMs via WinRM — CRLF is their native format.
+*.ps1 text eol=crlf
